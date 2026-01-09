@@ -112,7 +112,7 @@ def run_analyzer():
         
         print("-" * 125)
         print(f"{'TOTAL STORE SIZE (ALL STREAMS)':<45} : {format_bytes(total_size_bytes)}")
-        print(f"{'ESTIMATED ACTIVE DATA GROWTH PER DAY':<45} : {format_bytes(total_active_rate)}")
+        print(f"{'ESTIMATED ACTIVE DATA INGESTION PER DAY':<45} : {format_bytes(total_active_rate)}")
         print(f"{'TOTAL DATA STREAMS ANALYZED':<45} : {len(processed_data)}")
         print("-" * 125)
 
@@ -123,4 +123,5 @@ if __name__ == "__main__":
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
+
     run_analyzer()
