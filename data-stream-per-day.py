@@ -160,7 +160,7 @@ def process_data_stream(es_url, auth, ds):
 
 # ================= MAIN =================
 def main():
-    es_url = input("Masukkan Elasticsearch URL: ").strip()
+    es_url = input("Enter Elasticsearch URL: ").strip()
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
 
@@ -250,3 +250,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
