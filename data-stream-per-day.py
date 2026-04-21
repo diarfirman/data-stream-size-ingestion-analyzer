@@ -1,253 +1,146 @@
 import requests
 from requests.auth import HTTPBasicAuth
-from datetime import datetime, timezone
-import re
+from datetime import datetime, timezone, timedelta
 import time
 import getpass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= CONFIG =================
 MAX_WORKERS = 5
-MAX_RETRIES = 2
-RETRY_SLEEP = 1  # seconds
 
 # ================= UTIL =================
-def parse_size(size_str):
-    if not size_str:
-        return 0
-    size_str = size_str.lower().strip()
-    if size_str == "0b":
-        return 0
-
-    m = re.match(r"([\d\.]+)([a-z]+)", size_str)
-    if not m:
-        return 0
-
-    value, unit = m.groups()
-    value = float(value)
-
-    units = {
-        "b": 1,
-        "kb": 1024,
-        "mb": 1024 ** 2,
-        "gb": 1024 ** 3,
-        "tb": 1024 ** 4
-    }
-    return value * units.get(unit, 0)
-
-
-def safe_parse_ts(ts):
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if dt.year < 1970 or dt.year > 2100:
-            return None
-        return dt
-    except Exception:
-        return None
-
-
-def classify_status(age_days, last_seen_days):
-    if last_seen_days > 3:
-        return "STAGNANT"
-    if age_days < 2:
-        return "NEW/SHORT"
-    return "ACTIVE"
-
-
-def format_size_gb(value_gb):
+def format_size(value_gb):
     if value_gb >= 1:
         return f"{value_gb:.2f} GB"
     return f"{value_gb * 1024:.2f} MB"
 
-
-def format_ingest(value_gb_per_day):
-    if value_gb_per_day >= 1:
-        return f"{value_gb_per_day:.2f} GB"
-    return f"{value_gb_per_day * 1024:.2f} MB"
-
-
 # ================= ELASTIC =================
 def get_data_streams(es_url, auth):
-    r = requests.get(f"{es_url}/_data_stream", auth=auth, timeout=30)
+    # Menggunakan verify=False untuk menangani self-signed cert jika ada
+    r = requests.get(f"{es_url}/_data_stream", auth=auth, verify=False, timeout=30)
     r.raise_for_status()
     return [ds["name"] for ds in r.json()["data_streams"]]
 
-
-def process_data_stream(es_url, auth, ds):
+def process_ds_granular(es_url, auth, ds, start_dt, end_dt):
     session = requests.Session()
     session.auth = auth
+    session.verify = False
 
-    for attempt in range(1, MAX_RETRIES + 2):
-        try:
-            # ---------- AGE ----------
-            query = {
-                "size": 0,
-                "aggs": {
-                    "oldest": {"min": {"field": "@timestamp"}},
-                    "newest": {"max": {"field": "@timestamp"}}
-                }
-            }
+    try:
+        # 1. Ambil Stats khusus PRIMARIES (Langsung dari endpoint /_stats)
+        r_stats = session.get(f"{es_url}/{ds}/_stats", timeout=30)
+        if r_stats.status_code != 200:
+            return None
+        
+        stats_json = r_stats.json()
+        primaries = stats_json["_all"]["primaries"]
+        
+        # Menggunakan total_size_in_bytes dari dokumen primary
+        # Ini mencakup data mentah + overhead indexing tanpa replika
+        total_bytes_primary = primaries["docs"]["total_size_in_bytes"]
+        total_docs_primary = primaries["docs"]["count"]
 
-            r = session.get(f"{es_url}/{ds}/_search", json=query, timeout=30)
-            if r.status_code != 200:
-                return None
-
-            aggs = r.json().get("aggregations", {})
-            oldest = safe_parse_ts(aggs.get("oldest", {}).get("value_as_string", ""))
-            newest = safe_parse_ts(aggs.get("newest", {}).get("value_as_string", ""))
-
-            if not oldest or not newest:
-                return None
-
-            now = datetime.now(timezone.utc)
-            age_days = (newest - oldest).total_seconds() / 86400
-            last_seen_days = (now - newest).total_seconds() / 86400
-
-            if age_days <= 0:
-                return None
-
-            status = classify_status(age_days, last_seen_days)
-
-            # ---------- BACKING INDICES ----------
-            r = session.get(f"{es_url}/_data_stream/{ds}", timeout=30)
-            r.raise_for_status()
-            indices = [i["index_name"] for i in r.json()["data_streams"][0]["indices"]]
-
-            total_bytes = 0
-
-            for idx in indices:
-                r = session.get(
-                    f"{es_url}/_cat/indices/{idx}",
-                    params={"format": "json", "h": "dataset.size"},
-                    timeout=30
-                )
-                if r.status_code == 200 and r.json():
-                    total_bytes += parse_size(r.json()[0].get("dataset.size", "0b"))
-
-                restored = f"partial-restored-{idx}"
-                if session.head(f"{es_url}/{restored}", timeout=10).status_code == 200:
-                    r = session.get(
-                        f"{es_url}/_cat/indices/{restored}",
-                        params={"format": "json", "h": "dataset.size"},
-                        timeout=30
-                    )
-                    if r.status_code == 200 and r.json():
-                        total_bytes += parse_size(r.json()[0].get("dataset.size", "0b"))
-
-            if total_bytes == 0:
-                return None
-
-            size_gb = total_bytes / (1024 ** 3)
-            ingest_rate = size_gb / age_days
-
-            return {
-                "ds": ds,
-                "status": status,
-                "size_gb": size_gb,
-                "age_days": age_days,
-                "last_seen_days": last_seen_days,
-                "ingest_rate": ingest_rate
-            }
-
-        except Exception:
-            if attempt <= MAX_RETRIES:
-                time.sleep(RETRY_SLEEP * attempt)
-                continue
+        if total_docs_primary == 0:
             return None
 
-    return None
+        # 2. Hitung Rata-rata Ukuran per Dokumen (Hanya Primary)
+        avg_doc_size_bytes = total_bytes_primary / total_docs_primary
 
+        # 3. Hitung Jumlah Dokumen dalam Rentang Waktu
+        query = {
+            "query": {
+                "range": {
+                    "@timestamp": {
+                        "gte": start_dt.isoformat(),
+                        "lte": end_dt.isoformat()
+                    }
+                }
+            }
+        }
+        r_count = session.post(f"{es_url}/{ds}/_count", json=query, timeout=30)
+        if r_count.status_code != 200:
+            return None
+        
+        range_doc_count = r_count.json().get("count", 0)
+
+        # 4. Kalkulasi Akhir
+        est_range_size_gb = (range_doc_count * avg_doc_size_bytes) / (1024 ** 3)
+        
+        # Hitung selisih hari
+        delta = end_dt - start_dt
+        days_diff = delta.days + (delta.seconds / 86400)
+        if days_diff <= 0: days_diff = 1
+        
+        ingest_per_day_gb = est_range_size_gb / days_diff
+
+        return {
+            "ds": ds,
+            "range_docs": range_doc_count,
+            "est_size_gb": est_range_size_gb,
+            "ingest_rate_gb": ingest_per_day_gb
+        }
+
+    except Exception:
+        return None
 
 # ================= MAIN =================
 def main():
-    es_url = input("Enter Elasticsearch URL: ").strip()
+    print("=== Elasticsearch Primary-Only Ingest Analyzer ===")
+    es_url = input("Enter Elasticsearch URL (e.g https://localhost:9200): ").strip()
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
+    
+    print("\n--- Rentang Waktu Analisis ---")
+    start_str = input("Start Date (YYYY-MM-DD): ")
+    end_str = input("End Date (YYYY-MM-DD): ")
+    
+    try:
+        start_dt = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        # End date ditambahkan 1 hari agar mencakup akhir hari yang dipilih
+        end_dt = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1, seconds=-1)
+    except ValueError:
+        print("Format tanggal salah! Gunakan YYYY-MM-DD.")
+        return
 
     auth = HTTPBasicAuth(username, password)
+    requests.packages.urllib3.disable_warnings() 
 
-    data_streams = get_data_streams(es_url, auth)
-    total_ds = len(data_streams)
-
-    print(f"\n{total_ds} data stream")
-    print(f"Parallel workers: {MAX_WORKERS}\n")
+    try:
+        data_streams = get_data_streams(es_url, auth)
+    except Exception as e:
+        print(f"Gagal mengambil data streams: {e}")
+        return
 
     results = []
-    completed = 0
+    print(f"\nMenganalisis {len(data_streams)} data streams (Primary Shards Only)...\n")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_data_stream, es_url, auth, ds): ds
-            for ds in data_streams
-        }
-
+        futures = {executor.submit(process_ds_granular, es_url, auth, ds, start_dt, end_dt): ds for ds in data_streams}
         for future in as_completed(futures):
-            completed += 1
-            ds = futures[future]
-            try:
-                res = future.result()
-                if res:
-                    results.append(res)
-                    print(f"[{completed}/{total_ds}] {ds} OK")
-                else:
-                    print(f"[{completed}/{total_ds}] {ds} SKIPPED")
-            except Exception as e:
-                print(f"[{completed}/{total_ds}] {ds} ERROR ({e})")
+            res = future.result()
+            if res:
+                results.append(res)
+                print(f"[OK] {res['ds']}")
 
-    # ---------- SORT ----------
-    results.sort(key=lambda x: x["ingest_rate"], reverse=True)
+    # Sort berdasarkan ingest harian tertinggi
+    results.sort(key=lambda x: x["ingest_rate_gb"], reverse=True)
 
-    # ---------- EXCLUDE STAGNANT ----------
-    results = [r for r in results if r["status"] != "STAGNANT"]
+    # Table Output
+    col_ds, col_docs, col_size, col_rate = 50, 15, 18, 18
+    header = f"{'Data Stream Name':<{col_ds}}{'Range Docs':>{col_docs}}{'Est. Prim. Size':>{col_size}}{'Ingest/Day':>{col_rate}}"
+    line = "-" * (col_ds + col_docs + col_size + col_rate)
 
-    # ---------- TABLE ----------
-    COL_DS = 64
-    COL_STATUS = 12
-    COL_SIZE = 14
-    COL_RET = 12
-    COL_LAST = 12
-    COL_INGEST = 16
-
-    header = (
-        f"{'Data Stream Name':<{COL_DS}}"
-        f"{'Status':<{COL_STATUS}}"
-        f"{'Stream Size':>{COL_SIZE}}"
-        f"{'Retention':>{COL_RET}}"
-        f"{'Last Data':>{COL_LAST}}"
-        f"{'Ingest/Day':>{COL_INGEST}}"
-    )
-
-    line = "-" * (COL_DS + COL_STATUS + COL_SIZE + COL_RET + COL_LAST + COL_INGEST)
-
-    print("\n=== DATA STREAM ACTIVITY ANALYSIS (NON-STAGNANT ONLY) ===")
+    print(f"\nANALISIS PERIODE (PRIMARY ONLY): {start_str} s/d {end_str}")
     print(header)
     print(line)
 
-    total_size = 0.0
-    active_ingest = 0.0
-
+    total_daily_primary_ingest = 0
     for r in results:
-        total_size += r["size_gb"]
-        if r["status"] == "ACTIVE":
-            active_ingest += r["ingest_rate"]
-
-        last_data = "Now" if r["last_seen_days"] < 1 else f"{int(r['last_seen_days'])}d ago"
-
-        print(
-            f"{r['ds']:<{COL_DS}}"
-            f"{r['status']:<{COL_STATUS}}"
-            f"{format_size_gb(r['size_gb']):>{COL_SIZE}}"
-            f"{r['age_days']:>{COL_RET}.1f} d"
-            f"{last_data:>{COL_LAST}}"
-            f"{format_ingest(r['ingest_rate']):>{COL_INGEST}}"
-        )
+        total_daily_primary_ingest += r["ingest_rate_gb"]
+        print(f"{r['ds']:<{col_ds}}{r['range_docs']:>{col_docs},}{format_size(r['est_size_gb']):>{col_size}}{format_size(r['ingest_rate_gb']):>{col_rate}}")
 
     print(line)
-    print(f"TOTAL STORE SIZE (NON-STAGNANT STREAMS)        : {total_size:.2f} GB")
-    print(f"ESTIMATED ACTIVE DATA INGESTION PER DAY        : {active_ingest:.2f} GB")
-    print(f"TOTAL DATA STREAMS ANALYZED                    : {len(results)}")
-
+    print(f"ESTIMASI TOTAL INGESTION (PRIMARY) PER HARI: {total_daily_primary_ingest:.2f} GB")
 
 if __name__ == "__main__":
     main()
-
