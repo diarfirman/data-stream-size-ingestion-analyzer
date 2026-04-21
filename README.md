@@ -1,4 +1,4 @@
-# Elasticsearch Unified Ingest Analyzer
+# Elasticsearch Ingest Analyzer
 
 A Python command-line tool to estimate **daily and monthly ingest rates** across all your Elasticsearch storage — both **data streams** and **regular (conventional) indices** — using primary shard statistics only.
 
@@ -47,7 +47,7 @@ pip install requests
 ## Usage
 
 ```bash
-python unified-ingest-analyzer.py
+python ingest-analyzer.py
 ```
 
 The tool will prompt you for the following inputs:
