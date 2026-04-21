@@ -1,67 +1,191 @@
-# **Elasticsearch Ingest & Size Analyzer**
+# Elasticsearch Unified Ingest Analyzer
 
-A Python-based monitoring tool designed to provide deep insights into Elasticsearch Data Streams. This script helps administrators identify storage-heavy indices, calculate real-world ingestion rates, and distinguish between active and stagnant data.
+A Python command-line tool to estimate **daily and monthly ingest rates** across all your Elasticsearch storage — both **data streams** and **regular (conventional) indices** — using primary shard statistics only.
 
-## **Features**
+---
 
-* **Accurate Retention Calculation**: Uses Elasticsearch aggregations (min and max on @timestamp) to determine the actual time range of data stored.  
-* **Ingestion Rate Analytics**: Calculates the average data growth per day (Ingest/Day) for each data stream.  
-* **Activity Status Classification**: Automatically categorizes streams as ACTIVE, STAGNANT, or NEW/SHORT based on ingestion patterns.  
-* **Human-Readable Formatting**: Converts raw bytes into KB, MB, GB, or TB for easier analysis.  
-* **Security**: Uses getpass for secure password entry and handles self-signed SSL certificates.
+## How It Works
 
-## **Logic & Methodology**
+The tool intelligently detects how your data is stored and applies the most accurate analysis method for each type:
 
-The analyzer calculates metrics based on the following logic:
+| Storage Type | Detection Method | Analysis Method |
+|---|---|---|
+| **Data Stream** | `/_data_stream` API | Aggregate stats across all backing indices → filter by `@timestamp` |
+| **Regular Index** | `/_cat/indices` API | Per-index stats → auto-detect timestamp field → filter by time range |
 
-### **1\. Data Retention (Range)**
+### Why two methods?
 
-The script determines the "age" of a data stream by finding the earliest and latest @timestamp across all backing indices.
+- **Data streams** store data across multiple backing indices. Calculating the average document size from the full aggregate gives a more representative result than per-backing-index calculation.
+- **Regular indices** may or may not have a timestamp field, so the tool auto-detects it from the index mapping before querying.
 
-* **Formula**: (Max Timestamp \- Min Timestamp) \= Retention Days  
-* **Why?**: This shows how many days of history you are currently keeping in your cluster.
+### Excluded indices
 
-### **2\. Activity Status**
+The following index types are automatically excluded to prevent double-counting or irrelevant data:
 
-To help with capacity planning, the script assigns a status to each stream:
+- `partial-restored-*` — snapshot restore copies
+- `restored-*` — manually restored indices
+- `.` (dot-prefixed) — system indices (`.kibana`, `.security-*`, etc.)
+- `ilm-history-*` — ILM history indices
+- `shrink-*` — shrunk index copies
+- Backing indices of data streams (`.ds-{name}-*`) — already counted via the data stream method
 
-* **ACTIVE**: Data has been received within the last 3 days and the retention range is over 5 days.  
-* **STAGNANT**: No new data has been ingested for more than 3 days. These are primary candidates for deletion or archiving to save disk space.  
-* **NEW/SHORT**: The data stream is less than 5 days old. Ingestion rates for these might be skewed due to initial bulk loads.
+---
 
-### **3\. Ingestion Rate (Ingest/Day)**
+## Requirements
 
-This is the most critical metric for capacity planning.
+- Python **3.7+**
+- [`requests`](https://pypi.org/project/requests/) library
 
-* **Formula**: Total Store Size / Retention Days \= Ingest/Day  
-* **Note**: The rate is set to 0 for **STAGNANT** streams to prevent "ghost" growth projections from inflating your daily estimates.
+Install the dependency:
 
-### **4\. Last Data (Recency)**
-
-Calculates the delta between the current system time and the most recent document found. It tells you exactly how "fresh" the data in that stream is.
-
-## **Prerequisites**
-
-* Python 3.x  
-* requests library
-
+```bash
 pip install requests
+```
 
-## **Usage**
+---
 
-1. Clone this repository.  
-2. Run the script:  
-   python analyzer.py
+## Usage
 
-3. Provide your Elasticsearch URL (e.g., https://my-elasti-cluster:9200).  
-4. Enter your credentials when prompted.
+```bash
+python unified-ingest-analyzer.py
+```
 
-## **Example Output**
+The tool will prompt you for the following inputs:
 
-| Data Stream Name | Status | Stream Size | Retention | Last Data | Ingest/Day |
-| :---- | :---- | :---- | :---- | :---- | :---- |
-| logs-netflow.log-default | ACTIVE | 84.73 GB | 181.6 d | Now | 477.89 MB |
-| traces-generic.otel-default | ACTIVE | 133.20 GB | 181.4 d | 0.2d ago | 752.17 MB |
-| old-app-logs | STAGNANT | 50.00 GB | 90.0 d | 45.0d ago | 0 (Inactive) |
+```
+Elasticsearch URL (e.g. https://localhost:9200): https://your-cluster.elastic-cloud.com:443
+Username: your_username
+Password: ****************
 
-**Disclaimer**: This script disables SSL warnings by default to accommodate internal/self-signed certificates often found in local Elasticsearch deployments.
+--- Regular Index Filter (Optional) ---
+Example: 'app-logs-*', 'metrics-*', or leave blank for all
+Index pattern filter: 
+
+--- Analysis Time Range ---
+Start Date (YYYY-MM-DD): 2026-01-01
+End Date (YYYY-MM-DD): 2026-04-20
+```
+
+### Input Reference
+
+| Prompt | Description | Example |
+|---|---|---|
+| Elasticsearch URL | Full URL including port | `https://localhost:9200` |
+| Username | Elasticsearch username | `elastic` |
+| Password | Elasticsearch password (hidden input) | |
+| Index pattern filter | Wildcard filter for regular indices only. Leave blank for all. | `app-logs-*` |
+| Start Date | Beginning of analysis window | `2026-01-01` |
+| End Date | End of analysis window (inclusive) | `2026-04-20` |
+
+---
+
+## Output
+
+The tool runs in 4 steps and prints a structured report:
+
+```
+[1/4] Fetching data streams...        Found 173 data stream(s).
+[2/4] Fetching regular indices...     Found 25 regular index/indices.
+[3/4] Analyzing 173 data stream(s)...
+  [DS]  logs-endpoint.events.process-default
+  [DS]  traces-generic.otel-default
+  ...
+[4/4] Analyzing 25 regular index/indices...
+  [IDX] bank_transactions (@timestamp)
+  [IDX] customers (no-timestamp)
+  ...
+```
+
+### Results Table — Data Streams
+
+```
+[ DATA STREAMS ] — 85 active
+Name                                                    Range Docs   Est. Prim. Size        Ingest/Day
+------------------------------------------------------------------------------------------------------
+logs-endpoint.events.process-default                   156,812,284         169.45 GB           1.54 GB
+traces-generic.otel-default                            255,869,894          49.51 GB         460.92 MB
+...
+```
+
+### Results Table — Regular Indices
+
+```
+[ REGULAR INDICES ] — 12 active
+Name                                                    Range Docs   Est. Prim. Size        Ingest/Day
+------------------------------------------------------------------------------------------------------
+bank_transactions_v2                                        28,320          15.02 MB           0.14 MB
+...
+```
+
+### Grand Total
+
+```
+============================================================
+  GRAND TOTAL (PRIMARY SHARDS ONLY)
+============================================================
+  Data Streams          : 3.24 GB/day
+  Regular Indices       : 0.18 GB/day
+  ──────────────────────────────────────────
+  Total per Day         : 3.42 GB
+  Total per Month (~30d): 102.60 GB
+
+  Top 10 Highest Ingest Rate:
+   1. [DS ] logs-endpoint.events.process-default           1.54 GB/day
+   2. [DS ] traces-generic.otel-default                  460.92 MB/day
+   ...
+```
+
+- `[DS]` — result from a data stream
+- `[IDX]` — result from a regular index
+- `Est. Prim. Size` — estimated size of documents within the date range (primary shards only, no replicas)
+- `Ingest/Day` — average daily ingest rate over the selected period
+
+---
+
+## Configuration
+
+You can adjust the following constant at the top of the script:
+
+```python
+MAX_WORKERS = 5  # Number of parallel threads for analysis
+```
+
+Increase this value for faster analysis on large clusters, or decrease it to reduce load on the Elasticsearch cluster.
+
+---
+
+## Notes
+
+- **Self-signed certificates**: SSL verification is disabled (`verify=False`) to support self-signed or private CA certificates. A warning suppression is applied automatically.
+- **No timestamp field**: Regular indices without a detectable timestamp field are still analyzed, but the document count reflects **all documents** rather than a time-filtered subset. These are marked as `no timestamp field, counted all docs` in the processing log.
+- **Primary shards only**: All size estimates are based on primary shards only, excluding replicas. This gives a clean view of actual data volume without duplication from replication.
+- **Closed indices**: Indices with `status: close` are automatically skipped since they cannot be queried.
+- **Elasticsearch compatibility**: Tested against Elasticsearch 8.x. Compatible with Elastic Cloud and self-managed deployments.
+
+---
+
+## Example — Connecting to Elastic Cloud
+
+```
+Elasticsearch URL: https://my-deployment.es.us-east-1.aws.elastic-cloud.com:443
+Username: elastic
+Password: <your-cloud-password>
+```
+
+## Example — Connecting to Self-Managed (HTTP)
+
+```
+Elasticsearch URL: http://192.168.1.100:9200
+Username: elastic
+Password: <your-password>
+```
+
+---
+
+## File Structure
+
+```
+.
+├── unified-ingest-analyzer.py   # Main script
+└── README.md                    # This file
+```
